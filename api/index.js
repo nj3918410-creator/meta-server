@@ -475,7 +475,7 @@ async function confirmMetaOtp(sessionData, otpCode, useProxy = false) {
   }
 }
 
-// ==================== BATCH ====================
+// ==================== BATCH & SESSIONS ====================
 const SESSIONS = {};
 const BATCHES = {};
 
@@ -575,6 +575,25 @@ async function runBulk(batchId) {
 }
 
 // ==================== API ROUTES ====================
+
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    name: "Meta Creator Server",
+    version: "1.0.0",
+    endpoints: [
+      "/api/providers",
+      "/api/set_provider",
+      "/api/bulk_create",
+      "/api/bulk_status",
+      "/api/manual_create",
+      "/api/confirm",
+      "/api/ip_info",
+      "/api/set_proxy",
+    ],
+  });
+});
+
 app.post("/api/login", async (req, res) => {
   const key = (req.body?.key || "").trim().toUpperCase();
   if (!key) return res.json({ success: false, message: "No key" });
@@ -694,4 +713,118 @@ app.post("/api/set_proxy", async (req, res) => {
     ip: (data.ip || "").trim(),
     port: String(data.port || "").trim(),
     username: (data.username || "").trim(),
-    password: (data.password || "").
+    password: (data.password || "").trim(),
+    use_for_otp: Boolean(data.use_for_otp),
+  };
+  return res.json({ success: true, message: "Proxy set", ip: PROXY_CONFIG.ip });
+});
+
+app.post("/api/bulk_create", async (req, res) => {
+  const passwordStr = (req.body?.password || "").trim();
+  const count = parseInt(req.body?.count || "1", 10);
+  let provider = (req.body?.provider || "temptf").trim();
+  if (!TEMPMAIL_PROVIDERS[provider]) provider = "temptf";
+
+  if (!passwordStr || passwordStr.length < 6) {
+    return res.json({ success: false, message: "Password min 6" });
+  }
+  if (count < 1 || count > MAX_BULK) {
+    return res.json({ success: false, message: `1-${MAX_BULK}` });
+  }
+
+  const batchId = generateRandomToken(12);
+  BATCHES[batchId] = {
+    accounts: Array.from({ length: count }, (_, i) => ({
+      index: i + 1,
+      status: "pending",
+      email: "",
+      uid: "",
+      session_id: "",
+      confirmed_uid: "",
+    })),
+    done: false,
+    password: passwordStr,
+    provider,
+  };
+
+  runBulk(batchId);
+
+  return res.json({
+    success: true,
+    batch_id: batchId,
+    count,
+    provider_name: TEMPMAIL_PROVIDERS[provider].name,
+  });
+});
+
+app.get("/api/bulk_status", (req, res) => {
+  const batchId = req.query?.batch || "";
+  const batch = BATCHES[batchId];
+  if (!batch) return res.json({ error: "not found" });
+
+  const accounts = (batch.accounts || []).map((a) => ({
+    index: a.index || 0,
+    status: a.status || "unknown",
+    email: a.email || "",
+    password: batch.password || "",
+    uid: a.confirmed_uid || a.uid || "",
+    session_id: a.session_id || "",
+  }));
+
+  return res.json({ accounts, done: Boolean(batch.done) });
+});
+
+app.post("/api/manual_create", async (req, res) => {
+  try {
+    const email = (req.body?.email || "").trim();
+    const passwordStr = (req.body?.password || "").trim();
+    if (!email || !email.includes("@")) {
+      return res.json({ success: false, message: "Invalid email" });
+    }
+    if (!passwordStr || passwordStr.length < 6) {
+      return res.json({ success: false, message: "Password min 6" });
+    }
+
+    const result = await createMetaAccount(email, passwordStr);
+    if (!result || !result.success) {
+      return res.json({ success: false, message: result?.message || "Failed" });
+    }
+
+    const sid = generateRandomToken(16);
+    SESSIONS[sid] = result;
+    return res.json({
+      success: true,
+      session: sid,
+      email: result.email || email,
+      uid: result.uid || "",
+      password: result.password || passwordStr,
+    });
+  } catch (e) {
+    return res.json({ success: false, message: `Error: ${e.message?.substring(0, 200)}` });
+  }
+});
+
+app.post("/api/confirm", async (req, res) => {
+  try {
+    const sid = req.body?.session || "";
+    const otp = (req.body?.otp || "").replace(/\D/g, "");
+    if (!sid || !otp) {
+      return res.json({ confirmed: false, raw: "Missing params" });
+    }
+    const sessionData = SESSIONS[sid];
+    if (!sessionData) {
+      return res.json({ confirmed: false, raw: "Session expired" });
+    }
+
+    const result = await confirmMetaOtp(sessionData, otp, PROXY_CONFIG.use_for_otp);
+    if (result && result.confirmed) {
+      return res.json({ confirmed: true, uid: result.uid || "" });
+    }
+    return res.json({ confirmed: false, raw: result?.raw?.substring(0, 300) || "Failed" });
+  } catch (e) {
+    return res.json({ confirmed: false, raw: `Error: ${e.message?.substring(0, 200)}` });
+  }
+});
+
+// ==================== EXPORT FOR VERCEL ====================
+export default app;
