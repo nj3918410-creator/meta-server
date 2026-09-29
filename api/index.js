@@ -140,7 +140,6 @@ function calculateJazoest(token) {
 const TARGET_CREATE_URL = "https://auth.meta.com/login/device-based/register-save-credentials/";
 const TARGET_CONFIRM_URL = "https://auth.meta.com/api/graphql/";
 
-// 🇫🇷 France ভাষা
 const ACCEPT_LANGUAGE = "fr-FR,fr;q=0.9,en;q=0.8";
 
 const HEADERS_CREATE = {
@@ -181,6 +180,11 @@ const HEADERS_CONFIRM = {
   "sec-fetch-dest": "empty",
   "accept-language": ACCEPT_LANGUAGE,
   "priority": "u=1, i",
+};
+
+const HEADERS_RESEND = {
+  ...HEADERS_CONFIRM,
+  "x-fb-friendly-name": "FRLResendEmailMutation",
 };
 
 const HEADERS_TEMPMAIL = {
@@ -340,7 +344,7 @@ async function fetchInboxEmails(token, provider = "temptf") {
   }
 }
 
-// ==================== META CREATE + CONFIRM ====================
+// ==================== META CREATE ====================
 async function createMetaAccount(email, passwordStr) {
   const data = new URLSearchParams();
   for (const [k, v] of Object.entries(BASE_FORM_CREATE)) data.append(k, v);
@@ -416,6 +420,7 @@ async function createMetaAccount(email, passwordStr) {
   }
 }
 
+// ==================== CONFIRM OTP ====================
 async function confirmMetaOtp(sessionData, otpCode, useProxy = false) {
   try {
     const actorId = sessionData.uid;
@@ -475,16 +480,80 @@ async function confirmMetaOtp(sessionData, otpCode, useProxy = false) {
   }
 }
 
+// ==================== RESEND OTP TRIGGER ====================
+async function triggerResendOtp(sessionData) {
+  try {
+    const actorId = sessionData.uid;
+    const cookie = sessionData.cookie;
+    const savedCsi = sessionData.csi;
+    const savedWf = sessionData.waterfall_id;
+    const fbDtsg = sessionData.fb_dtsg || "NAfw3-iVgzAwb3wze6-QRU-d6X36d-knUVwny-8I9gCaoBHl9mph0_A:16:1789089771";
+    const lsd = sessionData.lsd || "mVvZ2A2krrrCYh31NtUS0j";
+    const jazoest = calculateJazoest(fbDtsg);
+
+    const vPayload = {
+      input: {
+        confirmation_code_type: "OTP_CODE",
+        event_flow: "login_manual",
+        rl_client_session_id: savedCsi,
+        waterfall_id: savedWf,
+        source_app_id: "1522763855472543",
+        actor_id: String(actorId),
+        client_mutation_id: "2",
+      },
+    };
+
+    const fData = new URLSearchParams();
+    fData.append("av", String(actorId));
+    fData.append("__user", "0");
+    fData.append("__a", "1");
+    fData.append("__req", "h");
+    fData.append("__hs", "20707.HYP:frl_comet_auth_pkg.2.1...0");
+    fData.append("dpr", "2");
+    fData.append("__ccg", "MODERATE");
+    fData.append("__rev", "1047236770");
+    fData.append("fb_dtsg", fbDtsg);
+    fData.append("jazoest", jazoest);
+    fData.append("lsd", lsd);
+    fData.append("variables", JSON.stringify(vPayload));
+    fData.append("doc_id", "7506257312537383");
+
+    const agent = getProxyAgent(true);
+    const config = {
+      headers: {
+        ...HEADERS_RESEND,
+        Cookie: cookie,
+        "x-fb-lsd": lsd,
+        referer: sessionData.confirm_link,
+      },
+      timeout: 20000,
+      validateStatus: () => true,
+    };
+    if (agent) { config.httpsAgent = agent; config.httpAgent = agent; }
+
+    const resp = await axios.post(TARGET_CONFIRM_URL, fData.toString(), config);
+    console.log(`Resend HTTP: ${resp.status}`);
+    return resp;
+  } catch (e) {
+    console.log(`triggerResendOtp error: ${e.message}`);
+    throw e;
+  }
+}
+
 // ==================== BATCH & SESSIONS ====================
 const SESSIONS = {};
 const BATCHES = {};
 
+// ============================================================
+//          MAIN ACCOUNT CREATOR (with Resend flow)
+// ============================================================
 async function createOneAccount(passwordStr, provider = "temptf") {
   const result = {
     success: false, status: "failed", email: "", password: passwordStr,
     uid: "", otp: "", message: "", provider,
   };
 
+  // ===== Step 1: Temp Mail =====
   const tempData = await createTempMail(provider);
   if (!tempData || !tempData.email) {
     result.message = "Temp mail create failed";
@@ -497,6 +566,7 @@ async function createOneAccount(passwordStr, provider = "temptf") {
   result.email = tempEmail;
   result.provider = actualProvider;
 
+  // ===== Step 2: Meta Account Create =====
   const meta = await createMetaAccount(tempEmail, passwordStr);
   if (!meta || !meta.success) {
     result.message = meta?.message || "Meta create failed";
@@ -504,11 +574,13 @@ async function createOneAccount(passwordStr, provider = "temptf") {
   }
 
   result.uid = meta.uid || "";
+  console.log(`[${tempEmail}] Account created UID: ${result.uid}`);
 
+  // ===== Step 3: প্রথম ১০s inbox চেক (4 × 2.5s) =====
   let otpCode = null;
   let checkpoint = false;
 
-  for (let attempt = 0; attempt < 30; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
     const emails = await fetchInboxEmails(tempToken, actualProvider);
     for (const em of emails) {
       if (!em || typeof em !== "object") continue;
@@ -533,12 +605,59 @@ async function createOneAccount(passwordStr, provider = "temptf") {
       if (otpCode) break;
     }
     if (otpCode || checkpoint) break;
-    await new Promise((r) => setTimeout(r, 3000));
+    await new Promise((r) => setTimeout(r, 2500));
   }
 
-  if (checkpoint) { result.status = "checkpoint"; result.message = "Checkpoint detected"; return result; }
-  if (!otpCode) { result.status = "otp_timeout"; result.message = "OTP not found"; return result; }
+  if (checkpoint) {
+    result.status = "checkpoint";
+    result.message = "Checkpoint detected";
+    return result;
+  }
 
+  // ===== Step 4: OTP না পেলে RESEND trigger =====
+  if (!otpCode) {
+    console.log(`[${tempEmail}] OTP not found in 10s — triggering RESEND`);
+    try {
+      await triggerResendOtp(meta);
+      console.log(`[${tempEmail}] Resend sent — waiting up to 20s`);
+    } catch (e) {
+      console.log(`[${tempEmail}] Resend failed: ${e.message}`);
+    }
+
+    // ===== Step 5: Resend এর পর ২০s wait (8 × 2.5s) =====
+    for (let attempt = 0; attempt < 8; attempt++) {
+      await new Promise((r) => setTimeout(r, 2500));
+
+      const emails = await fetchInboxEmails(tempToken, actualProvider);
+      for (const em of emails) {
+        if (!em || typeof em !== "object") continue;
+        const body = `${em.body_text || ""} ${em.body_html || ""}`;
+
+        const patterns = [
+          /Confirmation code\s*[:\s]*(\d{6})/i,
+          /letter-spacing:\s*2px;[^>]*>\s*(\d{6})\s*</,
+          /font-size:\s*24px[^>]*>\s*(\d{6})\s*</,
+          /\b(\d{6})\b/,
+        ];
+        for (const p of patterns) {
+          const m = body.match(p);
+          if (m) { otpCode = m[1]; break; }
+        }
+        if (otpCode) break;
+      }
+      if (otpCode) break;
+    }
+  }
+
+  if (!otpCode) {
+    result.status = "otp_timeout";
+    result.message = "OTP not found after resend";
+    return result;
+  }
+
+  console.log(`[${tempEmail}] OTP found: ${otpCode}`);
+
+  // ===== Step 6: Confirm OTP =====
   result.otp = otpCode;
   const confirm = await confirmMetaOtp(meta, otpCode, PROXY_CONFIG.use_for_otp);
   if (confirm && confirm.confirmed) {
@@ -546,6 +665,7 @@ async function createOneAccount(passwordStr, provider = "temptf") {
     result.status = "success";
     result.uid = confirm.uid || result.uid;
     result.message = "Confirmed";
+    console.log(`[${tempEmail}] ✅ SUCCESS UID: ${result.uid}`);
   } else {
     result.status = "confirm_failed";
     result.message = "OTP confirm failed";
@@ -580,7 +700,7 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     name: "Meta Creator Server",
-    version: "1.0.0",
+    version: "1.1.0",
     endpoints: [
       "/api/providers",
       "/api/set_provider",
@@ -592,80 +712,6 @@ app.get("/", (req, res) => {
       "/api/set_proxy",
     ],
   });
-});
-
-app.post("/api/login", async (req, res) => {
-  const key = (req.body?.key || "").trim().toUpperCase();
-  if (!key) return res.json({ success: false, message: "No key" });
-  const info = await fbGet(`keys/${key}`);
-  if (!info) return res.json({ success: false, message: "Invalid key" });
-  if (info.active === false) return res.json({ success: false, message: "Key deactivated" });
-  await fbPatch(`keys/${key}`, { last_login: new Date().toISOString() });
-  return res.json({ success: true, info });
-});
-
-app.get("/api/activation_status", async (req, res) => {
-  const key = (req.query?.key || "").trim().toUpperCase();
-  if (!key) return res.json({ active: false });
-  const allActs = (await fbGet("activation_keys")) || {};
-  let best = null;
-  const now = Date.now() / 1000;
-  for (const [ak, ainfo] of Object.entries(allActs)) {
-    if (!ainfo || typeof ainfo !== "object") continue;
-    const a = ainfo;
-    if (a.login_key !== key) continue;
-    const expTs = a.expire_ts || 0;
-    if (expTs > now && (!best || expTs > (best.expire_ts || 0))) {
-      best = { ...a, key: ak };
-    }
-  }
-  if (!best) return res.json({ active: false });
-  return res.json({
-    active: true, key: best.key || "", package: best.package || "",
-    expire_ts: best.expire_ts || 0, expire: best.expire || "",
-  });
-});
-
-app.get("/api/my_keys", async (req, res) => {
-  const key = (req.query?.key || "").trim().toUpperCase();
-  if (!key) return res.json({ success: false });
-  const allUsers = (await fbGet("users")) || {};
-  let user = null;
-  for (const [uid, u] of Object.entries(allUsers)) {
-    if (u && typeof u === "object" && u.login_key === key) { user = u; break; }
-  }
-  if (!user) return res.json({ success: false });
-  const keysList = Array.isArray(user.activated_keys) ? user.activated_keys : [];
-  const now = Date.now() / 1000;
-  const result = [];
-  for (const ak of keysList) {
-    const ainfo = (await fbGet(`activation_keys/${ak}`)) || {};
-    const expTs = ainfo.expire_ts || 0;
-    const active = expTs > now;
-    let remText = "";
-    if (active) {
-      const rem = Math.floor(expTs - now);
-      const d = Math.floor(rem / 86400);
-      const h = Math.floor((rem % 86400) / 3600);
-      const m = Math.floor((rem % 3600) / 60);
-      remText = `${d}d ${h}h ${m}m`;
-    }
-    result.push({ key: ak, package: ainfo.package || "-", active, remaining_text: remText });
-  }
-  return res.json({ success: true, keys: result });
-});
-
-app.post("/api/set_activation", async (req, res) => {
-  const loginKey = (req.body?.login_key || "").trim().toUpperCase();
-  const actKey = (req.body?.activation_key || "").trim().toUpperCase();
-  if (!loginKey || !actKey) return res.json({ success: false, message: "Missing params" });
-  const ainfo = await fbGet(`activation_keys/${actKey}`);
-  if (!ainfo) return res.json({ success: false, message: "Invalid activation key" });
-  if (ainfo.login_key && ainfo.login_key !== loginKey)
-    return res.json({ success: false, message: "Key belongs to another user" });
-  if ((ainfo.expire_ts || 0) < Date.now() / 1000)
-    return res.json({ success: false, message: "Activation key expired" });
-  return res.json({ success: true, message: "Activation key verified!", package: ainfo.package || "" });
 });
 
 app.get("/api/providers", (req, res) => {
@@ -680,43 +726,6 @@ app.post("/api/set_provider", (req, res) => {
   if (!TEMPMAIL_PROVIDERS[p]) return res.json({ success: false, message: "Unknown provider" });
   CURRENT_PROVIDER = p;
   return res.json({ success: true, provider: p });
-});
-
-app.get("/api/ip_info", async (req, res) => {
-  if (!PROXY_CONFIG.enabled || !PROXY_CONFIG.ip) {
-    return res.json({ success: false, ip: "", country: "", country_code: "", isp: "", is_proxy: false });
-  }
-  try {
-    const agent = getProxyAgent(true);
-    const config = { timeout: 8000 };
-    if (agent) { config.httpsAgent = agent; config.httpAgent = agent; }
-    const r = await axios.get("http://ip-api.com/json/?fields=status,country,countryCode,query,isp", config);
-    if (r.status === 200 && r.data?.status === "success") {
-      return res.json({
-        success: true, ip: r.data.query || PROXY_CONFIG.ip,
-        country: r.data.country || "", country_code: (r.data.countryCode || "").toUpperCase(),
-        isp: r.data.isp || "", is_proxy: true,
-      });
-    }
-  } catch (e) {}
-  return res.json({ success: true, ip: PROXY_CONFIG.ip, country: "Unknown", country_code: "", isp: "", is_proxy: true });
-});
-
-app.post("/api/set_proxy", async (req, res) => {
-  const data = req.body || {};
-  if (!data.enabled) {
-    PROXY_CONFIG = { enabled: false, ip: "", port: "", username: "", password: "", use_for_otp: false };
-    return res.json({ success: true, message: "Disabled" });
-  }
-  PROXY_CONFIG = {
-    enabled: true,
-    ip: (data.ip || "").trim(),
-    port: String(data.port || "").trim(),
-    username: (data.username || "").trim(),
-    password: (data.password || "").trim(),
-    use_for_otp: Boolean(data.use_for_otp),
-  };
-  return res.json({ success: true, message: "Proxy set", ip: PROXY_CONFIG.ip });
 });
 
 app.post("/api/bulk_create", async (req, res) => {
@@ -824,6 +833,43 @@ app.post("/api/confirm", async (req, res) => {
   } catch (e) {
     return res.json({ confirmed: false, raw: `Error: ${e.message?.substring(0, 200)}` });
   }
+});
+
+app.get("/api/ip_info", async (req, res) => {
+  if (!PROXY_CONFIG.enabled || !PROXY_CONFIG.ip) {
+    return res.json({ success: false, ip: "", country: "", country_code: "", isp: "", is_proxy: false });
+  }
+  try {
+    const agent = getProxyAgent(true);
+    const config = { timeout: 8000 };
+    if (agent) { config.httpsAgent = agent; config.httpAgent = agent; }
+    const r = await axios.get("http://ip-api.com/json/?fields=status,country,countryCode,query,isp", config);
+    if (r.status === 200 && r.data?.status === "success") {
+      return res.json({
+        success: true, ip: r.data.query || PROXY_CONFIG.ip,
+        country: r.data.country || "", country_code: (r.data.countryCode || "").toUpperCase(),
+        isp: r.data.isp || "", is_proxy: true,
+      });
+    }
+  } catch (e) {}
+  return res.json({ success: true, ip: PROXY_CONFIG.ip, country: "Unknown", country_code: "", isp: "", is_proxy: true });
+});
+
+app.post("/api/set_proxy", async (req, res) => {
+  const data = req.body || {};
+  if (!data.enabled) {
+    PROXY_CONFIG = { enabled: false, ip: "", port: "", username: "", password: "", use_for_otp: false };
+    return res.json({ success: true, message: "Disabled" });
+  }
+  PROXY_CONFIG = {
+    enabled: true,
+    ip: (data.ip || "").trim(),
+    port: String(data.port || "").trim(),
+    username: (data.username || "").trim(),
+    password: (data.password || "").trim(),
+    use_for_otp: Boolean(data.use_for_otp),
+  };
+  return res.json({ success: true, message: "Proxy set", ip: PROXY_CONFIG.ip });
 });
 
 // ==================== EXPORT FOR VERCEL ====================
