@@ -136,11 +136,23 @@ function calculateJazoest(token) {
   return "2" + sum;
 }
 
+function extractToken(html, name) {
+  if (!html) return "";
+  try {
+    const re = new RegExp('name="' + name + '"\\s+value="([^"]+)"');
+    const m = html.match(re);
+    return m ? m[1] : "";
+  } catch (e) {
+    return "";
+  }
+}
+
 // ==================== META HEADERS ====================
 const TARGET_CREATE_URL = "https://auth.meta.com/login/device-based/register-save-credentials/";
 const TARGET_CONFIRM_URL = "https://auth.meta.com/api/graphql/";
 
 const ACCEPT_LANGUAGE = "fr-FR,fr;q=0.9,en;q=0.8";
+const FB_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 
 const HEADERS_CREATE = {
   "User-Agent": "Mozilla/5.0 (Linux; Android 12; itel S665L Build/SP1A.210812.016) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.7977.87 Mobile Safari/537.36",
@@ -545,7 +557,7 @@ const SESSIONS = {};
 const BATCHES = {};
 
 // ============================================================
-//          MAIN ACCOUNT CREATOR (with Resend flow)
+//          MAIN META ACCOUNT CREATOR (with Resend flow)
 // ============================================================
 async function createOneAccount(passwordStr, provider = "temptf") {
   const result = {
@@ -553,7 +565,6 @@ async function createOneAccount(passwordStr, provider = "temptf") {
     uid: "", otp: "", message: "", provider,
   };
 
-  // ===== Step 1: Temp Mail =====
   const tempData = await createTempMail(provider);
   if (!tempData || !tempData.email) {
     result.message = "Temp mail create failed";
@@ -566,7 +577,6 @@ async function createOneAccount(passwordStr, provider = "temptf") {
   result.email = tempEmail;
   result.provider = actualProvider;
 
-  // ===== Step 2: Meta Account Create =====
   const meta = await createMetaAccount(tempEmail, passwordStr);
   if (!meta || !meta.success) {
     result.message = meta?.message || "Meta create failed";
@@ -576,7 +586,6 @@ async function createOneAccount(passwordStr, provider = "temptf") {
   result.uid = meta.uid || "";
   console.log(`[${tempEmail}] Account created UID: ${result.uid}`);
 
-  // ===== Step 3: প্রথম ১০s inbox চেক (4 × 2.5s) =====
   let otpCode = null;
   let checkpoint = false;
 
@@ -614,7 +623,6 @@ async function createOneAccount(passwordStr, provider = "temptf") {
     return result;
   }
 
-  // ===== Step 4: OTP না পেলে RESEND trigger =====
   if (!otpCode) {
     console.log(`[${tempEmail}] OTP not found in 10s — triggering RESEND`);
     try {
@@ -624,7 +632,6 @@ async function createOneAccount(passwordStr, provider = "temptf") {
       console.log(`[${tempEmail}] Resend failed: ${e.message}`);
     }
 
-    // ===== Step 5: Resend এর পর ২০s wait (8 × 2.5s) =====
     for (let attempt = 0; attempt < 8; attempt++) {
       await new Promise((r) => setTimeout(r, 2500));
 
@@ -657,7 +664,6 @@ async function createOneAccount(passwordStr, provider = "temptf") {
 
   console.log(`[${tempEmail}] OTP found: ${otpCode}`);
 
-  // ===== Step 6: Confirm OTP =====
   result.otp = otpCode;
   const confirm = await confirmMetaOtp(meta, otpCode, PROXY_CONFIG.use_for_otp);
   if (confirm && confirm.confirmed) {
@@ -699,11 +705,15 @@ async function runBulk(batchId) {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    name: "Meta Creator Server",
-    version: "1.1.0",
+    name: "Meta + Facebook Creator Server",
+    version: "2.0.0",
     endpoints: [
       "/api/providers",
       "/api/set_provider",
+      "/api/tempmail/create",
+      "/api/tempmail/inbox",
+      "/api/facebook_create",
+      "/api/facebook_confirm",
       "/api/bulk_create",
       "/api/bulk_status",
       "/api/manual_create",
@@ -728,6 +738,181 @@ app.post("/api/set_provider", (req, res) => {
   return res.json({ success: true, provider: p });
 });
 
+// ==================== TEMP MAIL API ====================
+app.post("/api/tempmail/create", async (req, res) => {
+  const provider = (req.body?.provider || "temptf");
+  const tempData = await createTempMail(provider);
+  if (!tempData || !tempData.email) {
+    return res.json({ success: false, message: "Temp mail failed" });
+  }
+  return res.json({
+    success: true,
+    email: tempData.email,
+    token: tempData.token || tempData.email,
+    provider: tempData.provider || provider,
+  });
+});
+
+app.get("/api/tempmail/inbox", async (req, res) => {
+  const token = req.query?.token || "";
+  const provider = req.query?.provider || "temptf";
+  const emails = await fetchInboxEmails(token, provider);
+  return res.json({ success: true, emails: emails });
+});
+
+// ==================== FACEBOOK CREATE API ====================
+app.post("/api/facebook_create", async (req, res) => {
+  const email = ((req.body?.email) || "").trim();
+  const password = ((req.body?.password) || "").trim();
+
+  if (!email || !password) {
+    return res.json({ success: false, message: "Missing email/password" });
+  }
+
+  try {
+    const getRes = await axios.get(
+      "https://limited.facebook.com/reg/?app_id=103&shouldForceMTouch=1",
+      {
+        headers: {
+          "User-Agent": FB_USER_AGENT,
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+        timeout: 15000,
+        validateStatus: () => true,
+      }
+    );
+
+    const html = typeof getRes.data === "string" ? getRes.data : "";
+    const lsd = extractToken(html, "lsd") || "AdRg5ufqsQVcQXAYMc0sAcuMAYE";
+    const jazoest = extractToken(html, "jazoest") || "2931";
+    const regInstance = extractToken(html, "reg_instance") || "9XYnakzu3MZlEdcKm5l6S7Xh";
+
+    const fname = "Test";
+    const lname = "User";
+    const bday = 15, bmonth = 6, byear = 1998;
+
+    const postData = new URLSearchParams();
+    postData.append("ccp", "2");
+    postData.append("reg_instance", regInstance);
+    postData.append("submission_request", "true");
+    postData.append("app_id", "103");
+    postData.append("field_names[0]", "firstname");
+    postData.append("firstname", fname);
+    postData.append("lastname", lname);
+    postData.append("field_names[1]", "birthday_wrapper");
+    postData.append("birthday_day", String(bday));
+    postData.append("birthday_month", String(bmonth));
+    postData.append("birthday_year", String(byear));
+    postData.append("field_names[2]", "reg_email__");
+    postData.append("reg_email__", email);
+    postData.append("field_names[3]", "sex");
+    postData.append("sex", "1");
+    postData.append("field_names[4]", "reg_passwd__");
+    postData.append("reg_passwd__", password);
+    postData.append("submit", "Sign+up");
+    postData.append("lsd", lsd);
+    postData.append("jazoest", jazoest);
+    postData.append("m_ts", String(Math.floor(Date.now() / 1000)));
+    postData.append("li", "Fb_Gen_iOS");
+
+    const postRes = await axios.post(
+      "https://limited.facebook.com/reg/submit/?app_id=103&multi_step_form=1&skip_suma=0&shouldForceMTouch=1",
+      postData.toString(),
+      {
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": FB_USER_AGENT,
+          "Referer": "https://limited.facebook.com/reg/?app_id=103&shouldForceMTouch=1",
+          "Origin": "https://limited.facebook.com",
+        },
+        timeout: 20000,
+        validateStatus: () => true,
+        maxRedirects: 0,
+      }
+    );
+
+    const setCookies = postRes.headers["set-cookie"] || [];
+    const fullC = {};
+    let uid = "";
+    for (const c of setCookies) {
+      const m = c.match(/^([^=]+)=([^;]+)/);
+      if (m) {
+        fullC[m[1]] = m[2];
+        if (m[1] === "c_user") uid = m[2];
+      }
+    }
+
+    const cookieStr = Object.keys(fullC).map(k => `${k}=${fullC[k]}`).join("; ");
+    const success = (postRes.status === 302 || postRes.status === 303);
+
+    return res.json({
+      success: success,
+      uid: uid,
+      cookies: cookieStr,
+      status: postRes.status,
+      message: success ? "Account created" : "Failed (HTTP " + postRes.status + ")",
+    });
+
+  } catch (e) {
+    return res.json({ success: false, message: e.message });
+  }
+});
+
+// ==================== FACEBOOK OTP CONFIRM ====================
+app.post("/api/facebook_confirm", async (req, res) => {
+  const email = ((req.body?.email) || "").trim();
+  const otp = ((req.body?.otp) || "").trim();
+
+  if (!email || !otp) {
+    return res.json({ success: false, message: "Missing params" });
+  }
+
+  try {
+    const url = "https://limited.facebook.com/confirm/?app_id=103&shouldForceMTouch=1";
+    const formData = new URLSearchParams();
+    formData.append("code", otp);
+    formData.append("submit", "Continue");
+
+    const confirmRes = await axios.post(url, formData.toString(), {
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": FB_USER_AGENT,
+        "Referer": "https://limited.facebook.com/confirm/",
+        "Origin": "https://limited.facebook.com",
+      },
+      timeout: 20000,
+      validateStatus: () => true,
+      maxRedirects: 0,
+    });
+
+    const setCookies = confirmRes.headers["set-cookie"] || [];
+    const fullC = {};
+    let uid = "";
+    for (const c of setCookies) {
+      const m = c.match(/^([^=]+)=([^;]+)/);
+      if (m) {
+        fullC[m[1]] = m[2];
+        if (m[1] === "c_user") uid = m[2];
+      }
+    }
+
+    const cookieStr = Object.keys(fullC).map(k => `${k}=${fullC[k]}`).join("; ");
+    const success = (confirmRes.status === 302 || confirmRes.status === 303 || confirmRes.status === 200);
+
+    return res.json({
+      success: success,
+      uid: uid,
+      cookies: cookieStr,
+      status: confirmRes.status,
+      message: success ? "Confirmed" : "Failed",
+    });
+
+  } catch (e) {
+    return res.json({ success: false, message: e.message });
+  }
+});
+
+// ==================== META BULK CREATE ====================
 app.post("/api/bulk_create", async (req, res) => {
   const passwordStr = (req.body?.password || "").trim();
   const count = parseInt(req.body?.count || "1", 10);
